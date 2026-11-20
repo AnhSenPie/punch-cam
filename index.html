@@ -7,10 +7,11 @@
 <style>
   html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
   canvas{position:fixed;inset:0;width:100%;height:100%}
-  #g3,#ui{pointer-events:none}
+  #ui{pointer-events:none}
   #hud{position:fixed;top:12px;left:0;right:0;display:flex;justify-content:space-between;padding:0 16px;color:#fff;font-weight:800;font-size:22px;text-shadow:0 2px 6px #000;pointer-events:none}
-  #status{position:fixed;top:48px;left:0;right:0;text-align:center;color:#fff;font-size:14px;text-shadow:0 1px 4px #000;pointer-events:none}
-  #flip{position:fixed;top:10px;left:50%;transform:translateX(-50%);padding:6px 14px;border-radius:20px;border:0;background:#0008;color:#fff;font-size:14px}
+  #status{position:fixed;top:52px;left:0;right:0;text-align:center;color:#fff;font-size:14px;text-shadow:0 1px 4px #000;pointer-events:none}
+  #bar{position:fixed;top:10px;left:50%;transform:translateX(-50%);display:none;gap:8px}
+  #bar button{padding:6px 14px;border-radius:20px;border:0;background:#0008;color:#fff;font-size:14px;white-space:nowrap}
   #start{position:fixed;inset:0;display:flex;flex-direction:column;gap:16px;align-items:center;justify-content:center;background:#111e;color:#fff;text-align:center;padding:24px}
   #start button{font-size:22px;padding:14px 36px;border:0;border-radius:14px;background:#e53935;color:#fff;font-weight:800}
   #start p{max-width:360px;line-height:1.5;margin:0;opacity:.9}
@@ -20,16 +21,16 @@
 </script>
 </head>
 <body>
-<canvas id="c"></canvas>
 <canvas id="g3"></canvas>
 <canvas id="ui"></canvas>
-<video id="v" playsinline muted style="display:none"></video>
+<!-- không dùng display:none: Chrome Android có thể tạm dừng video bị ẩn hẳn -->
+<video id="v" playsinline muted autoplay style="position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;pointer-events:none"></video>
 <div id="hud"><span id="score">Điểm: 0</span><span id="combo"></span></div>
 <div id="status"></div>
-<button id="flip" style="display:none">Đổi camera</button>
+<div id="bar"><button id="flip">Đổi camera</button><button id="reset">Mặt mới</button></div>
 <div id="start">
   <h1 style="margin:0">🥊 Punch Cam</h1>
-  <p>Bật camera, hướng vào mặt bạn (hoặc con mèo/chó). Chạm nửa trái màn hình = găng đỏ đấm, nửa phải = găng xanh. Bấm liên tục để đấm liên hoàn. Phím <b>A</b>/<b>L</b> trên máy tính.</p>
+  <p>Bật camera, hướng vào mặt bạn (hoặc con mèo/chó). Chạm nửa trái màn hình = găng đỏ, nửa phải = găng xanh. <b>Giữ ngón tay</b> để đấm liên hoàn. Phím <b>A</b>/<b>L</b> trên máy tính.</p>
   <button id="go">Bắt đầu</button>
   <div id="err" style="color:#ff8a80"></div>
 </div>
@@ -40,73 +41,151 @@ import * as THREE from 'three';
 import {RoomEnvironment} from 'three/addons/environments/RoomEnvironment.js';
 
 const $ = id => document.getElementById(id);
-const cv = $('c'), ctx = cv.getContext('2d');
 const ui = $('ui'), uctx = ui.getContext('2d');
 const video = $('v');
-let W=0,H=0,DPR=Math.min(devicePixelRatio||1,2);
+let W=0,H=0;
+const DPR=Math.min(devicePixelRatio||1,2);
+const GL_DPR=Math.min(devicePixelRatio||1,1.75);   // giới hạn để điện thoại không nặng
 
-// ---------- Three.js: găng 3D ----------
-const renderer=new THREE.WebGLRenderer({canvas:$('g3'),alpha:true,antialias:true});
-renderer.setPixelRatio(DPR);renderer.setClearColor(0x000000,0);
-renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=1.05;
+// ---------- Three.js ----------
+// MSAA chỉ bật khi màn hình mật độ thấp (màn dày điểm ảnh không cần, lại tốn GPU)
+const renderer=new THREE.WebGLRenderer({canvas:$('g3'),antialias:(devicePixelRatio||1)<1.5,powerPreference:'high-performance'});
+renderer.setPixelRatio(GL_DPR);
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+renderer.autoClear=false;
+// 2 lớp: nền video (camera trực giao theo pixel) + găng 3D (camera phối cảnh, có trục Z thật)
+const sceneBG=new THREE.Scene();
+const cam=new THREE.OrthographicCamera(0,1,0,-1,-4000,4000);cam.position.z=2000;
 const scene=new THREE.Scene();
 const pmrem=new THREE.PMREMGenerator(renderer);
 scene.environment=pmrem.fromScene(new RoomEnvironment(),0.04).texture;
-scene.environmentIntensity=0.9;
-// camera trực giao theo pixel màn hình: x=0..W, y=0..-H
-const cam=new THREE.OrthographicCamera(0,1,0,-1,-4000,4000);cam.position.z=2000;
-const key=new THREE.DirectionalLight(0xffffff,2.4);key.position.set(-500,900,1200);scene.add(key);
-const rim=new THREE.DirectionalLight(0xffffff,1.0);rim.position.set(800,-200,-600);scene.add(rim);
+const FOV=45;
+const pcam=new THREE.PerspectiveCamera(FOV,1,10,50000);
+let F=1; // tiêu cự tính theo pixel
+const keyL=new THREE.DirectionalLight(0xffffff,2.4);keyL.position.set(-0.4,0.8,1);scene.add(keyL);
+const rimL=new THREE.DirectionalLight(0xffffff,0.9);rimL.position.set(0.7,-0.2,-0.6);scene.add(rimL);
+// Mặt người nằm ở độ sâu DF (1 đơn vị = 1px tại đó). Găng nghỉ ở DR (gần camera hơn -> to hơn).
+const DF=()=>F, DR=()=>F*0.58;
+function to3D(x,y,D,o=new THREE.Vector3()){return o.set((x-W/2)*D/F,-(y-H/2)*D/F,-D)}
+function toScr(v){const D=-v.z;return [W/2+v.x*F/D,H/2-v.y*F/D,F/D]}
+
+// ---------- Video + biến dạng mặt chạy trên GPU ----------
+const MAXH=24;
+const vtex=new THREE.VideoTexture(video);
+vtex.minFilter=THREE.LinearFilter;vtex.magFilter=THREE.LinearFilter;vtex.generateMipmaps=false;
+const U={
+  uTex:{value:vtex},uScreen:{value:new THREE.Vector2(1,1)},
+  uMap:{value:new THREE.Vector4(1,0,0,0)},      // s, ox, oy, mirror
+  uVid:{value:new THREE.Vector2(1,1)},          // kích thước video trên màn hình
+  uTgt:{value:new THREE.Vector4(0,0,100,100)},  // tâm mặt x,y, R, bề rộng mặt
+  uN:{value:0},
+  uHA:{value:Array.from({length:MAXH},()=>new THREE.Vector4())}, // x,y,dx,dy
+  uHB:{value:Array.from({length:MAXH},()=>new THREE.Vector4())}, // lún cục bộ, hất cả đầu, xoay, độ đỏ
+  uGl:{value:[new THREE.Vector4(),new THREE.Vector4()]},          // bóng găng: x,y,r,alpha
+};
+const COMMON=`
+uniform vec2 uScreen;uniform vec4 uTgt;uniform int uN;uniform vec4 uHA[${MAXH}];uniform vec4 uHB[${MAXH}];
+varying vec2 vP;`;
+const videoMat=new THREE.ShaderMaterial({
+  uniforms:U,depthTest:false,depthWrite:false,
+  vertexShader:COMMON+`
+  void main(){
+    vec2 p=vec2(uv.x*uScreen.x,(1.0-uv.y)*uScreen.y);
+    vP=p;
+    vec2 c=uTgt.xy;float R=uTgt.z,w=uTgt.w;
+    float wide=exp(-dot(p-c,p-c)/(R*R*5.0));
+    vec2 off=vec2(0.0);float rot=0.0;
+    for(int i=0;i<${MAXH};i++){
+      if(i>=uN)break;
+      vec2 hp=uHA[i].xy,d=uHA[i].zw,r=p-hp;
+      float f=exp(-dot(r,r)/(R*R)*2.2);
+      float kl=uHB[i].x,kw=uHB[i].y;
+      off+=d*(w*0.42*kl)*f-r*(0.32*kl*f)+d*(w*0.20*kw)*wide; // lún theo hướng đấm + má móp + cả đầu bị đẩy
+      rot+=uHB[i].z*wide;
+    }
+    vec2 q=p+off-c;float cr=cos(rot),sr=sin(rot);
+    vec2 np=c+vec2(q.x*cr-q.y*sr,q.x*sr+q.y*cr);
+    float e=smoothstep(0.0,60.0,min(min(p.x,uScreen.x-p.x),min(p.y,uScreen.y-p.y))); // mép màn hình đứng yên
+    np=p+(np-p)*e;
+    gl_Position=projectionMatrix*modelViewMatrix*vec4(np.x,-np.y,0.0,1.0);
+  }`,
+  fragmentShader:COMMON+`
+  uniform sampler2D uTex;uniform vec4 uMap;uniform vec2 uVid;uniform vec4 uGl[2];
+  void main(){
+    vec2 p=vP;
+    float sx=uMap.w>0.5?uScreen.x-p.x:p.x;
+    vec2 t=vec2((sx-uMap.y)/uVid.x,(p.y-uMap.z)/uVid.y);
+    vec3 col=texture2D(uTex,vec2(t.x,1.0-t.y)).rgb;
+    float R=uTgt.z,red=0.0;
+    vec2 dc=p-uTgt.xy;
+    if(dot(dc,dc)<R*R*6.0) for(int i=0;i<${MAXH};i++){ // chỉ tính quanh khuôn mặt
+      if(i>=uN)break;
+      vec2 r=p-uHA[i].xy;
+      red+=exp(-dot(r,r)/(R*R*0.10))*uHB[i].w;           // vết đỏ dính trên da (đi theo biến dạng)
+    }
+    col=mix(col,vec3(1.0,0.22,0.3),clamp(red,0.0,0.6));
+    for(int i=0;i<2;i++){vec2 r=(p-uGl[i].xy)/max(uGl[i].z,1.0);col*=1.0-uGl[i].w*exp(-dot(r,r)*2.5);} // bóng găng
+    gl_FragColor=vec4(col,1.0);
+  }`
+});
+const videoMesh=new THREE.Mesh(new THREE.PlaneGeometry(1,1,54,96),videoMat);
+videoMesh.frustumCulled=false;videoMesh.renderOrder=-1;videoMesh.position.z=-1500;
+sceneBG.add(videoMesh);
 
 function resize(){
   W=innerWidth;H=innerHeight;
-  for(const c of[cv,ui]){c.width=W*DPR;c.height=H*DPR}
-  ctx.setTransform(DPR,0,0,DPR,0,0);uctx.setTransform(DPR,0,0,DPR,0,0);
+  ui.width=W*DPR;ui.height=H*DPR;uctx.setTransform(DPR,0,0,DPR,0,0);
   renderer.setSize(W,H,false);cam.right=W;cam.bottom=-H;cam.updateProjectionMatrix();
+  pcam.aspect=W/H;pcam.updateProjectionMatrix();F=(H/2)/Math.tan(THREE.MathUtils.degToRad(FOV/2));
+  U.uScreen.value.set(W,H);
 }
 addEventListener('resize',resize);resize();
 
+// ---------- Găng 3D ----------
 function makeGlove(color,thumbSide){
-  const root=new THREE.Group();          // xoay theo hướng đấm (trục Z màn hình)
+  const root=new THREE.Group();          // xoay theo hướng đấm
   const tilt=new THREE.Group();root.add(tilt); // nghiêng vào trong màn hình -> chiều sâu
-  const leather=new THREE.MeshPhysicalMaterial({color,roughness:.32,clearcoat:1,clearcoatRoughness:.12,sheen:.4,sheenRoughness:.5});
-  const cuffMat=new THREE.MeshPhysicalMaterial({color:new THREE.Color(color).multiplyScalar(.72),roughness:.5,clearcoat:.5,clearcoatRoughness:.3});
+  const leather=new THREE.MeshStandardMaterial({color,roughness:.28,envMapIntensity:1.2});
+  const cuffMat=new THREE.MeshStandardMaterial({color:new THREE.Color(color).multiplyScalar(.72),roughness:.5});
   const trim=new THREE.MeshStandardMaterial({color:0xf4f4f4,roughness:.55});
   const metal=new THREE.MeshStandardMaterial({color:0xc9ced6,metalness:1,roughness:.28});
-  const sph=new THREE.SphereGeometry(1,48,32);
+  const sph=new THREE.SphereGeometry(1,28,20);
   const add=(geo,mat,pos,scale,rot)=>{const m=new THREE.Mesh(geo,mat);m.position.set(...pos);if(scale)m.scale.set(...scale);if(rot)m.rotation.set(...rot);tilt.add(m);return m};
   add(sph,leather,[0,10,0],[58,64,52]);                   // thân găng
-  add(sph,leather,[0,46,4],[55,38,50]);                   // phần đốt tay phía trước
+  add(sph,leather,[0,46,4],[55,38,50]);                   // đốt tay phía trước
   add(sph,leather,[0,24,34],[46,46,22]);                  // ngón tay cuộn lại phía mu
-  add(new THREE.CapsuleGeometry(17,34,8,24),leather,[thumbSide*52,0,16],null,[0.25,0,thumbSide*0.42]); // ngón cái
-  add(new THREE.CylinderGeometry(38,33,36,48),cuffMat,[0,-52,0]);   // cổ găng (màu trơn)
-  add(new THREE.TorusGeometry(39,5.5,16,64),trim,[0,-36,0],null,[Math.PI/2,0,0]); // viền trắng
-  add(new THREE.CylinderGeometry(22,22,10,32),metal,[0,-74,0]);     // đế gắn lò xo
+  add(new THREE.CapsuleGeometry(17,34,6,16),leather,[thumbSide*52,0,16],null,[0.25,0,thumbSide*0.42]); // ngón cái
+  add(new THREE.CylinderGeometry(38,33,36,32),cuffMat,[0,-52,0]);   // cổ găng (màu trơn)
+  add(new THREE.TorusGeometry(39,5.5,12,48),trim,[0,-36,0],null,[Math.PI/2,0,0]); // viền trắng
+  add(new THREE.CylinderGeometry(22,22,10,24),metal,[0,-74,0]);     // đế gắn lò xo
   const anchor=new THREE.Object3D();anchor.position.set(0,-78,0);tilt.add(anchor);
   scene.add(root);
-  const spring=new THREE.Mesh(new THREE.BufferGeometry(),metal);scene.add(spring);
+  const spring=new THREE.Mesh(new THREE.BufferGeometry(),metal);spring.frustumCulled=false;scene.add(spring);
   return {root,tilt,anchor,spring};
 }
+// Lò xo xoắn ốc giữa 2 điểm bất kỳ trong không gian 3D
 class Helix extends THREE.Curve{
-  constructor(a,b,r,coils){super();this.a=a;this.b=b;this.r=r;this.coils=coils;
-    this.ax=b.clone().sub(a);const l=this.ax.length()||1;
-    this.n1=new THREE.Vector3(-this.ax.y/l,this.ax.x/l,0);this.n2=new THREE.Vector3(0,0,1)}
+  constructor(a,b,r,coils){super();this.a=a;this.r=r;this.coils=coils;
+    this.ax=b.clone().sub(a);const n=this.ax.clone().normalize();
+    this.n1=new THREE.Vector3().crossVectors(n,new THREE.Vector3(0,0,1));
+    if(this.n1.lengthSq()<1e-4)this.n1.crossVectors(n,new THREE.Vector3(1,0,0));
+    this.n1.normalize();this.n2=new THREE.Vector3().crossVectors(n,this.n1)}
   getPoint(t,o=new THREE.Vector3()){
     const an=t*this.coils*Math.PI*2,r=this.r*(t<.04||t>.96?.6:1);
     return o.copy(this.a).addScaledVector(this.ax,t).addScaledVector(this.n1,Math.cos(an)*r).addScaledVector(this.n2,Math.sin(an)*r)}
 }
-const tmpV=new THREE.Vector3();
-function poseGlove(m,px,py,ang,s,tiltX,roll,bx,by){
-  m.root.position.set(px,-py,0);
-  m.root.rotation.z=-ang-Math.PI/2;
+const tmpV=new THREE.Vector3(),UPY=new THREE.Vector3(0,1,0),dirV=new THREE.Vector3();
+// đặt găng tại điểm p (3D), mũi găng chĩa theo hướng từ đế lò xo -> găng
+function poseGlove(m,p,base,s,roll){
+  m.root.position.copy(p);
+  dirV.subVectors(p,base).normalize();
+  m.root.quaternion.setFromUnitVectors(UPY,dirV);
   m.root.scale.setScalar(s);
-  m.tilt.rotation.set(tiltX,roll,0);
+  m.tilt.rotation.set(0,roll,0);   // xoắn cổ tay khi đấm
   m.root.updateMatrixWorld(true);
   m.anchor.getWorldPosition(tmpV);
-  const a=new THREE.Vector3(bx,-by,-60);
-  const r=Math.max(9,15*s);
   m.spring.geometry.dispose();
-  m.spring.geometry=new THREE.TubeGeometry(new Helix(a,tmpV.clone(),r,11),180,Math.max(2.6,3.6*s),8,false);
+  m.spring.geometry=new THREE.TubeGeometry(new Helix(base.clone(),tmpV.clone(),15*s,11),90,3.6*s,5,false);
 }
 
 let facing='user', stream=null, faceLm=null, objDet=null, audio=null;
@@ -125,7 +204,7 @@ function map(){
   const s=Math.max(W/vw,H/vh);
   return {s, ox:(W-vw*s)/2, oy:(H-vh*s)/2, vw, vh};
 }
-function toScreen(px,py,m){ // px,py in video pixels
+function toScreen(px,py,m){
   let x=px*m.s+m.ox, y=py*m.s+m.oy;
   if(mirrored()) x=W-x;
   return [x,y];
@@ -161,215 +240,177 @@ function detect(){
       const b=best.boundingBox;
       const [ax,ay]=toScreen(b.originX,b.originY,m),[bx,by]=toScreen(b.originX+b.width,b.originY+b.height,m);
       const w=Math.abs(bx-ax),h=Math.abs(by-ay),cx=(ax+bx)/2;
-      // đầu thú cưng ~ nửa trên của khung
-      const hw=w*0.5,hh=h*0.5,hx=cx,hy=Math.min(ay,by)+hh*0.6;
+      const hw=w*0.5,hh=h*0.5,hx=cx,hy=Math.min(ay,by)+hh*0.6; // đầu thú cưng ~ nửa trên của khung
       setTarget({x:hx,y:hy,w:hw,h:hh},'pet',[[hx-hw*.3,hy+hh*.1],[hx+hw*.3,hy+hh*.1]]);
       found=true;
     }
-  }
+  } else if(objDet) found=target.ok&&target.kind==='pet'; // khung không chạy detector: giữ nguyên
   if(!found && ++target.lost>20) target.ok=false;
 }
 
 // ---------- Game state ----------
-let score=0, combo=0, comboT=0, redness=0, shake=0;
+let score=0, combo=0, comboT=0, shake=0;
 const fist=[
   {color:'#e53935',baseX:()=>W*0.16,restX:()=>W*0.25,state:'idle',t:0,queue:0},
   {color:'#2f8fdc',baseX:()=>W*0.84,restX:()=>W*0.75,state:'idle',t:0,queue:0},
 ];
 fist.forEach((g,i)=>g.mesh=makeGlove(g.color,i===0?1:-1));
-let hits=[], popups=[];
-const gloveScale=()=>Math.min(1.5,Math.max(.95,W*.27/116));
-const restY=()=>H*0.80, baseY=()=>H+40;
+let hits=[], bruises=[], popups=[];
+const held=[0,0];
+// bề rộng găng khi nghỉ (px trên màn hình), tính theo khung dọc/ngang
+const restW=()=>Math.min(300,Math.max(110,Math.min(W*0.36,H*0.21)));
+const gloveWorld=()=>restW()*DR()/F/116;          // tỉ lệ model 3D
+const restY=()=>H*0.83, baseY=()=>H*1.12;
+// toạ độ tương đối theo khuôn mặt -> vết đấm đi theo mặt khi mặt di chuyển
+const rel=(x,y)=>[(x-target.x)/target.w,(y-target.y)/target.h];
+const abs=(u,v)=>[target.x+u*target.w,target.y+v*target.h];
 
 function launch(side){
   const g=fist[side];
-  // xuất phát từ vị trí hiện tại (có thể đang giữa chừng) -> đấm liên hoàn mượt
-  g.fx=g.px??g.restX(); g.fy=g.py??restY(); g.fs=g.sc??1;
+  g.from=(g.p||to3D(g.restX(),restY(),DR())).clone();   // đi tiếp từ vị trí hiện tại
   g.state='out'; g.t=0;
-  const tg=target.ok?target:{x:W/2,y:H*0.4,w:200,h:260};
+  const tg=target.ok?target:{x:W/2,y:H*0.4,w:W*0.5,h:W*0.65};
   // găng trái đánh vào má bên trái màn hình, găng phải vào má bên phải
   const ch=target.ok?[...target.cheeks].sort((a,b)=>a[0]-b[0])[side]:[tg.x+(side?1:-1)*tg.w*.25,tg.y];
-  g.tx=ch[0]+(Math.random()-.5)*tg.w*0.10; g.ty=ch[1]-tg.h*0.05+(Math.random()-.5)*tg.h*0.10;
-  const dx=g.tx-g.baseX(),dy=g.ty-baseY(),dl=Math.hypot(dx,dy)||1; g.dx=dx/dl; g.dy=dy/dl;
-  // găng to lên cỡ khuôn mặt khi chạm, như clip demo
-  g.es=Math.max(0.7,Math.min(2.0,tg.w*0.62/(116*gloveScale())));
+  g.tx=ch[0]+(Math.random()-.5)*tg.w*0.12; g.ty=ch[1]-tg.h*0.05+(Math.random()-.5)*tg.h*0.12;
+  const dx=g.tx-g.restX(),dy=g.ty-restY(),dl=Math.hypot(dx,dy)||1; g.dx=dx/dl; g.dy=dy/dl;
+  // độ sâu chỗ trúng: luôn xa hơn chỗ nghỉ (bay vào trong theo trục Z),
+  // chọn sao cho găng khi chạm to khoảng nửa khuôn mặt
+  const wW=gloveWorld()*116;
+  g.depth=Math.max(DR()*1.3,Math.min(DF()*1.6,F*wW/(0.5*tg.w)));
+  g.to=to3D(g.tx,g.ty,g.depth);
+  g.fwd=g.to.clone().sub(g.from).normalize();
   g.hit=target.ok;
   woosh();
 }
+const canRelaunch=g=>g.state==='idle'||(g.state==='back'&&g.t>=0.55);
 function punch(side){
   const g=fist[side];
-  // đang lao ra/ghì vào má -> xếp hàng cú tiếp theo; đang rút về/đứng yên -> đấm ngay
-  if(g.state==='out'||g.state==='hold'){g.queue=Math.min(3,g.queue+1);return}
-  launch(side);
+  if(canRelaunch(g)) launch(side);
+  else g.queue=Math.min(2,g.queue+1);
 }
 function onHit(g,side){
   if(!g.hit) return;
-  combo++; comboT=1.5; score+=10*Math.min(combo,10);
-  redness=Math.min(1,redness+0.2); shake=Math.min(22,shake+12);
-  hits.push({t:0,side:side===0?1:-1,x:g.tx,y:g.ty,dx:g.dx,dy:g.dy});
-  if(hits.length>5) hits.shift();
-  const pw=target.ok?target.w:200;
-  popups.push({x:g.tx+(side===0?-1:1)*pw*0.45+(Math.random()-.5)*30,y:g.ty-pw*0.35+(Math.random()-.5)*40,t:0,txt:['BỐP!','POW!','BÙM!','CHÁT!'][Math.random()*4|0]});
+  combo++; comboT=1.2; score+=10*Math.min(combo,10);
+  shake=Math.min(18,shake+9);
+  const [u,v]=rel(g.tx,g.ty), sd=side===0?1:-1;
+  hits.push({u,v,dx:g.dx,dy:g.dy,side:sd,t:0});
+  if(hits.length>6) hits.shift();
+  // vết móp + vết đỏ ở lại trên mặt, cộng dồn (không reset)
+  const near=bruises.find(b=>b.side===sd&&Math.hypot(b.u-u,b.v-v)<0.3);
+  if(near){near.amp=Math.min(0.30,near.amp+0.05);near.red=Math.min(0.55,near.red+0.07);near.u+=(u-near.u)*.2;near.v+=(v-near.v)*.2}
+  else{bruises.push({u,v,dx:g.dx,dy:g.dy,side:sd,amp:0.12,red:0.22});if(bruises.length>MAXH-6)bruises.shift()}
+  const pw=target.w;
+  popups.push({x:g.tx-sd*pw*0.45+(Math.random()-.5)*30,y:g.ty-pw*0.35+(Math.random()-.5)*40,t:0,txt:['BỐP!','POW!','BÙM!','CHÁT!'][Math.random()*4|0]});
+  if(popups.length>6) popups.shift();
   thump();
-  if(navigator.vibrate) navigator.vibrate(35);
+  if(navigator.vibrate) try{navigator.vibrate(30)}catch{}
   $('score').textContent='Điểm: '+score;
 }
-cv.addEventListener('pointerdown',e=>{e.preventDefault();audioInit();punch(e.clientX<W/2?0:1)});
-addEventListener('keydown',e=>{if(e.repeat)return;const k=e.key.toLowerCase();if(k==='a'||k==='arrowleft')punch(0);if(k==='l'||k==='arrowright')punch(1);if(k===' ')punch(Math.random()<.5?0:1)});
+
+// ---------- Input: chạm = 1 cú, giữ = đấm liên hoàn ----------
+const ptrSide=new Map();
+addEventListener('pointerdown',e=>{
+  if(e.target.closest('button,#start')) return;
+  e.preventDefault();audioInit();
+  const s=e.clientX<W/2?0:1;ptrSide.set(e.pointerId,s);held[s]++;punch(s);
+},{passive:false});
+const ptrUp=e=>{if(!ptrSide.has(e.pointerId))return;const s=ptrSide.get(e.pointerId);held[s]=Math.max(0,held[s]-1);ptrSide.delete(e.pointerId)};
+addEventListener('pointerup',ptrUp);addEventListener('pointercancel',ptrUp);
+const keySide=k=>(k==='a'||k==='arrowleft')?0:(k==='l'||k==='arrowright')?1:-1;
+addEventListener('keydown',e=>{if(e.repeat)return;const s=keySide(e.key.toLowerCase());if(s<0)return;held[s]++;punch(s)});
+addEventListener('keyup',e=>{const s=keySide(e.key.toLowerCase());if(s>=0)held[s]=Math.max(0,held[s]-1)});
+addEventListener('blur',()=>{held[0]=held[1]=0;ptrSide.clear()});
 
 // ---------- Audio (synth) ----------
 function audioInit(){if(!audio){audio=new (window.AudioContext||window.webkitAudioContext)()} if(audio.state==='suspended')audio.resume()}
 function woosh(){if(!audio)return;const t=audio.currentTime,o=audio.createOscillator(),g=audio.createGain();
-  o.type='sawtooth';o.frequency.setValueAtTime(500,t);o.frequency.exponentialRampToValueAtTime(150,t+.12);
-  g.gain.setValueAtTime(.06,t);g.gain.exponentialRampToValueAtTime(.001,t+.14);o.connect(g).connect(audio.destination);o.start(t);o.stop(t+.15)}
+  o.type='sawtooth';o.frequency.setValueAtTime(500,t);o.frequency.exponentialRampToValueAtTime(150,t+.1);
+  g.gain.setValueAtTime(.05,t);g.gain.exponentialRampToValueAtTime(.001,t+.12);o.connect(g).connect(audio.destination);o.start(t);o.stop(t+.13)}
+let noiseBuf=null;
 function thump(){if(!audio)return;const t=audio.currentTime,o=audio.createOscillator(),g=audio.createGain();
   o.type='sine';o.frequency.setValueAtTime(170+Math.random()*30,t);o.frequency.exponentialRampToValueAtTime(40,t+.2);
-  g.gain.setValueAtTime(.8,t);g.gain.exponentialRampToValueAtTime(.001,t+.25);o.connect(g).connect(audio.destination);o.start(t);o.stop(t+.3);
-  const n=audio.createBufferSource(),b=audio.createBuffer(1,audio.sampleRate*.08,audio.sampleRate),d=b.getChannelData(0);
-  for(let i=0;i<d.length;i++)d[i]=(Math.random()*2-1)*(1-i/d.length);
-  const ng=audio.createGain();ng.gain.value=.45;n.buffer=b;n.connect(ng).connect(audio.destination);n.start(t)}
+  g.gain.setValueAtTime(.8,t);g.gain.exponentialRampToValueAtTime(.001,t+.22);o.connect(g).connect(audio.destination);o.start(t);o.stop(t+.25);
+  if(!noiseBuf){noiseBuf=audio.createBuffer(1,audio.sampleRate*.08,audio.sampleRate);const d=noiseBuf.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=(Math.random()*2-1)*(1-i/d.length)}
+  const n=audio.createBufferSource(),ng=audio.createGain();ng.gain.value=.45;n.buffer=noiseBuf;n.connect(ng).connect(audio.destination);n.start(t)}
 
-// ---------- Drawing ----------
+// ---------- Update ----------
 const ease=t=>1-Math.pow(1-t,3);
-const tmp=document.createElement('canvas'),tctx=tmp.getContext('2d');
-function drawVideo(){
-  const m=map();ctx.save();
-  if(mirrored()){ctx.translate(W,0);ctx.scale(-1,1)}
-  ctx.drawImage(video,m.ox,m.oy,m.vw*m.s,m.vh*m.s);ctx.restore();
-}
-// Vẽ 1 tam giác có texture (biến đổi affine từ toạ độ nguồn sang đích)
-function texTri(img,s0,s1,s2,d0,d1,d2){
-  const ux=s1[0]-s0[0],uy=s1[1]-s0[1],vx=s2[0]-s0[0],vy=s2[1]-s0[1];
-  const det=ux*vy-uy*vx; if(Math.abs(det)<1e-6) return;
-  const Ux=d1[0]-d0[0],Uy=d1[1]-d0[1],Vx=d2[0]-d0[0],Vy=d2[1]-d0[1];
-  const a=(Ux*vy-Vx*uy)/det,c=(Vx*ux-Ux*vx)/det,b=(Uy*vy-Vy*uy)/det,d=(Vy*ux-Uy*vx)/det;
-  const e=d0[0]-a*s0[0]-c*s0[1],f=d0[1]-b*s0[0]-d*s0[1];
-  // nới nhẹ tam giác ra 0.6px để không hở đường nối
-  const mx=(d0[0]+d1[0]+d2[0])/3,my=(d0[1]+d1[1]+d2[1])/3,ex=p=>{const l=Math.hypot(p[0]-mx,p[1]-my)||1;return [p[0]+(p[0]-mx)/l*.6,p[1]+(p[1]-my)/l*.6]};
-  const p0=ex(d0),p1=ex(d1),p2=ex(d2);
-  ctx.save();ctx.beginPath();ctx.moveTo(p0[0],p0[1]);ctx.lineTo(p1[0],p1[1]);ctx.lineTo(p2[0],p2[1]);ctx.closePath();ctx.clip();
-  ctx.transform(a,b,c,d,e,f);ctx.drawImage(img,0,0);ctx.restore();
-}
-const GN=14;
-// ăn đòn rất nhanh, giữ lúc găng ghì vào má, rồi đầu nảy lại tắt dần
-const hitK=t=>t<0.08? ease(t/0.08) : t<0.22? 1 : Math.exp(-(t-0.22)*6)*Math.cos((t-0.22)*15);
-function drawWarp(dt){
-  for(const h of hits) h.t+=dt/0.85;
-  hits=hits.filter(h=>h.t<1);
-  if(!hits.length||!target.ok) return;
-  const R=Math.max(target.w,target.h)*0.62;          // vùng ảnh hưởng của cú đấm
-  const rw=R*3.6,rh=R*3.6,sx=Math.max(0,target.x-rw/2),sy=Math.max(0,target.y-rh/2);
-  const sw=Math.min(W-sx,rw),sh=Math.min(H-sy,rh);
-  if(sw<16||sh<16) return;
-  tmp.width=Math.round(sw*DPR);tmp.height=Math.round(sh*DPR);
-  tctx.drawImage(cv,sx*DPR,sy*DPR,sw*DPR,sh*DPR,0,0,tmp.width,tmp.height);
-  const cx=target.x,cy=target.y;
-  // các cú đấm liên tiếp cộng dồn, nhưng giới hạn để mặt không bị gập
-  const hs=hits.map(h=>{const k=hitK(h.t);return {...h,k,A:target.w*0.42*k,B:target.w*0.20*k}});
-  const norm=Math.min(1,1.3/hs.reduce((s,h)=>s+Math.abs(h.k),0.0001));
-  const grid=[];
-  for(let j=0;j<=GN;j++)for(let i=0;i<=GN;i++){
-    const X=sx+sw*i/GN,Y=sy+sh*j/GN;
-    const wide=Math.exp(-((X-cx)**2+(Y-cy)**2)/(R*R*5)); // cả cái đầu bị hất
-    // mép vùng vẽ phải đứng yên để khớp với video phía dưới
-    const ex=Math.min(i,GN-i)/(GN*.18),ey=Math.min(j,GN-j)/(GN*.18),edge=Math.min(1,ex,ey);
-    let ox=0,oy=0,rot=0;
-    for(const h of hs){
-      const rx=X-h.x,ry=Y-h.y,f=Math.exp(-(rx*rx+ry*ry)/(R*R)*2.2); // cục bộ quanh chỗ trúng
-      ox+=h.dx*h.A*f-rx*0.32*h.k*f+h.dx*h.B*wide;  // lún theo hướng đấm + má móp + đầu bị đẩy
-      oy+=h.dy*h.A*f-ry*0.32*h.k*f+h.dy*h.B*wide;
-      rot+=h.side*0.35*h.k*wide;
-    }
-    ox*=norm;oy*=norm;rot*=norm;
-    const qx=X+ox-cx,qy=Y+oy-cy,cr=Math.cos(rot),sr=Math.sin(rot); // đầu nghiêng
-    const nx=cx+qx*cr-qy*sr,ny=cy+qx*sr+qy*cr;
-    grid.push([X+(nx-X)*edge,Y+(ny-Y)*edge]);
-  }
-  const S=(i,j)=>[(i/GN)*tmp.width,(j/GN)*tmp.height];
-  for(let j=0;j<GN;j++)for(let i=0;i<GN;i++){
-    const g00=grid[j*(GN+1)+i],g10=grid[j*(GN+1)+i+1],g01=grid[(j+1)*(GN+1)+i],g11=grid[(j+1)*(GN+1)+i+1];
-    texTri(tmp,S(i,j),S(i+1,j),S(i,j+1),g00,g10,g01);
-    texTri(tmp,S(i+1,j),S(i+1,j+1),S(i,j+1),g10,g11,g01);
-  }
-  // vết đỏ tại chỗ trúng đấm, đi theo da bị biến dạng
-  for(const h of hs){
-    const mk=Math.max(0,h.k)*norm; if(mk<0.02) continue;
-    const px=h.x+h.dx*h.A*norm,py=h.y+h.dy*h.A*norm,r=R*0.55,gr=ctx.createRadialGradient(px,py,0,px,py,r);
-    gr.addColorStop(0,`rgba(255,50,70,${.5*Math.min(1,mk)})`);gr.addColorStop(1,'rgba(255,50,70,0)');
-    ctx.fillStyle=gr;ctx.fillRect(px-r,py-r,r*2,r*2);
-  }
-}
-function drawCheeks(){
-  if(!target.ok||redness<=0.01) return;
-  for(const [x,y] of target.cheeks){
-    const r=target.w*0.2,g=ctx.createRadialGradient(x,y,0,x,y,r);
-    g.addColorStop(0,`rgba(255,40,70,${redness*.65})`);g.addColorStop(1,'rgba(255,40,70,0)');
-    ctx.fillStyle=g;ctx.fillRect(x-r,y-r,r*2,r*2);
-  }
-}
-// bóng đổ mềm của găng lên mặt/nền -> tăng cảm giác chiều sâu
-function drawGloveShadows(){
-  for(const g of fist){
-    if(g.px==null) continue;
-    const s=g.sc*gloveScale(),near=g.state==='hold'?1:g.state==='out'?ease(Math.min(g.t,1)):0;
-    const ox=18*s*(1-near*.5),oy=30*s*(1-near*.5),r=62*s;
-    const gr=ctx.createRadialGradient(g.px+ox,g.py+oy,r*.2,g.px+ox,g.py+oy,r);
-    gr.addColorStop(0,`rgba(0,0,0,${.28+near*.2})`);gr.addColorStop(1,'rgba(0,0,0,0)');
-    ctx.fillStyle=gr;ctx.fillRect(g.px+ox-r,g.py+oy-r,r*2,r*2);
-  }
-}
+// ăn đòn rất nhanh, giữ lúc găng ghì vào má, rồi nảy lại về mức vết móp còn lưu
+const hitK=t=>t<0.12? ease(t/0.12) : t<0.3? 1 : Math.exp(-(t-0.3)*6)*Math.cos((t-0.3)*15);
 function updateGloves(dt){
   fist.forEach((g,i)=>{
-    const bx=g.baseX(),by=baseY(),rx=g.restX(),ry=restY(),es=g.es||1;
-    let px=rx,py=ry,sc=1,reach=0;
-    if(g.state==='out'){g.t+=dt/0.085;const f=ease(Math.min(g.t,1));
-      px=g.fx+(g.tx-g.fx)*f;py=g.fy+(g.ty-g.fy)*f;sc=g.fs+(es-g.fs)*f;reach=f;
+    const rest=to3D(g.restX(),restY(),DR()), base=to3D(g.baseX(),baseY(),DR()*0.72);
+    const pxk=DR()/F; // 1px màn hình tại độ sâu chỗ nghỉ, theo đơn vị 3D
+    // giữ tay hoặc đã bấm dồn -> đấm tiếp ngay khi găng rút về được nửa đường (chu kỳ liên tục)
+    if((held[i]>0||g.queue>0)&&canRelaunch(g)){if(g.queue>0)g.queue--;launch(i)}
+    if(!g.p) g.p=rest.clone();
+    let reach=0;
+    if(g.state==='out'){g.t+=dt/0.09;const f=ease(Math.min(g.t,1));
+      g.p.lerpVectors(g.from,g.to,f);reach=f;               // bay thẳng vào trong theo trục Z
       if(g.t>=1){g.state='hold';g.t=0;onHit(g,i)}}
-    else if(g.state==='hold'){ // găng ghì vào má một nhịp, như clip
-      const dur=g.queue>0?0.05:0.12;g.t+=dt/dur;const p=Math.sin(Math.min(g.t,1)*Math.PI);
-      px=g.tx+g.dx*p*target.w*0.10;py=g.ty+g.dy*p*target.w*0.10;sc=es;reach=1;
-      if(g.t>=1){
-        if(g.queue>0){g.queue--;g.px=px;g.py=py;g.sc=sc;launch(i)}
-        else{g.state='back';g.t=0;g.fx=px;g.fy=py;g.fs=sc}}}
-    else if(g.state==='back'){g.t+=dt/0.30;const f=ease(Math.min(g.t,1)),e=1-f;
-      px=rx+(g.fx-rx)*e;py=ry+(g.fy-ry)*e;sc=1+(g.fs-1)*e;reach=e;
-      // dao động lò xo khi về
-      py+=Math.sin(g.t*14)*(1-f)*18;if(g.t>=1)g.state='idle'}
-    else{ // đứng yên: nhún nhẹ như đang thủ thế
-      const tt=performance.now()/1000;py+=Math.sin(tt*3+i*1.7)*4;px+=Math.cos(tt*2.3+i)*2}
-    g.px=px;g.py=py;g.sc=sc;
-    const ang=Math.atan2(py-by,px-bx),s=sc*gloveScale();
-    // khi lao ra, găng chúi vào trong màn hình và xoắn nhẹ như cú đấm thật
-    const side=i===0?1:-1;
-    poseGlove(g.mesh,px,py,ang,s,-0.25-0.35*reach,side*0.40*reach,bx,by);
+    else if(g.state==='hold'){ // găng ghì sâu thêm vào má một nhịp
+      g.t+=dt/0.05;const k=Math.sin(Math.min(g.t,1)*Math.PI);
+      g.p.copy(g.to).addScaledVector(g.fwd,k*gloveWorld()*30);reach=1;
+      if(g.t>=1){g.state='back';g.t=0;g.from=g.p.clone()}}
+    else if(g.state==='back'){g.t+=dt/0.20;const f=ease(Math.min(g.t,1));
+      g.p.lerpVectors(g.from,rest,f);reach=1-f;
+      if(held[i]===0&&g.queue===0) g.p.y+=Math.sin(g.t*14)*(1-f)*14*pxk; // lò xo rung khi về hẳn
+      if(g.t>=1)g.state='idle'}
+    else{const tt=performance.now()/1000;g.p.copy(rest);g.p.y+=Math.sin(tt*3+i*1.7)*4*pxk;g.p.x+=Math.cos(tt*2.3+i)*2*pxk} // thủ thế
+    const side=i===0?1:-1, s=gloveWorld();
+    poseGlove(g.mesh,g.p,base,s,side*0.5*reach);
+    // bóng găng đổ lên video (chiếu vị trí 3D xuống màn hình)
+    const [sx,sy,k]=toScr(g.p),near=g.state==='hold'?1:g.state==='out'?ease(Math.min(g.t,1)):0;
+    U.uGl.value[i].set(sx+14*s*k*(1-near*.4),sy+26*s*k*(1-near*.4),60*s*k,.22+near*.25);
   });
 }
+function updateWarp(dt){
+  for(const h of hits) h.t+=dt/0.8;
+  hits=hits.filter(h=>h.t<1);
+  const m=map();
+  U.uMap.value.set(m.s,m.ox,m.oy,mirrored()?1:0);U.uVid.value.set(m.vw*m.s,m.vh*m.s);
+  if(!target.ok){U.uN.value=0;return}
+  U.uTgt.value.set(target.x,target.y,Math.max(target.w,target.h)*0.62,target.w);
+  // cú đấm đang diễn ra: chuẩn hoá để nhiều cú chồng nhau không làm mặt bị gập
+  const ks=hits.map(h=>hitK(h.t));
+  const norm=Math.min(1,1.0/Math.max(1e-4,ks.reduce((s,k)=>s+Math.abs(k),0)));
+  let n=0;const A=U.uHA.value,B=U.uHB.value;
+  for(const b of bruises){if(n>=MAXH)break;const [x,y]=abs(b.u,b.v);A[n].set(x,y,b.dx,b.dy);B[n].set(b.amp,0,0,b.red);n++}
+  hits.forEach((h,j)=>{if(n>=MAXH)return;const k=ks[j]*norm,[x,y]=abs(h.u,h.v);
+    A[n].set(x,y,h.dx,h.dy);B[n].set(k*0.85,k,h.side*0.35*k,0.35*Math.max(0,k));n++});
+  U.uN.value=n;
+}
 
-let last=performance.now();
+let last=performance.now(),statusTxt='',comboTxt='';
 function loop(now){
   requestAnimationFrame(loop);
   const dt=Math.min((now-last)/1000,.05);last=now;
   detect();
-  let shx=0,shy=0;
-  if(shake>0.3){shx=(Math.random()-.5)*shake;shy=(Math.random()-.5)*shake;shake*=0.85}
-  ctx.setTransform(DPR,0,0,DPR,0,0);ctx.clearRect(0,0,W,H);
-  ctx.save();ctx.translate(shx,shy);
   updateGloves(dt);
-  drawVideo();drawWarp(dt);drawCheeks();drawGloveShadows();
-  ctx.restore();
+  updateWarp(dt);
+  let shx=0,shy=0;
+  if(shake>0.3){shx=(Math.random()-.5)*shake;shy=(Math.random()-.5)*shake;shake*=0.82}
   cam.position.x=-shx;cam.position.y=shy;
-  renderer.render(scene,cam);
+  pcam.position.set(-shx*DR()/F,shy*DR()/F,0);
+  renderer.clear();
+  renderer.render(sceneBG,cam);   // nền video đã biến dạng
+  renderer.clearDepth();
+  renderer.render(scene,pcam);    // găng 3D phối cảnh
   // chữ BỐP! nằm trên cùng
   uctx.clearRect(0,0,W,H);
-  for(const p of popups){p.t+=dt;const a=1-p.t/.7;if(a<=0)continue;
-    uctx.save();uctx.globalAlpha=a;uctx.font='900 '+(54+p.t*40)+'px system-ui';uctx.textAlign='center';
-    uctx.lineWidth=8;uctx.strokeStyle='#000';uctx.fillStyle='#ffe135';
-    uctx.strokeText(p.txt,p.x,p.y-p.t*80);uctx.fillText(p.txt,p.x,p.y-p.t*80);uctx.restore()}
-  popups=popups.filter(p=>p.t<.7);
-  redness=Math.max(0,redness-dt*0.12);
+  if(popups.length){
+    uctx.font='900 60px system-ui';uctx.textAlign='center';uctx.lineWidth=8;uctx.strokeStyle='#000';uctx.fillStyle='#ffe135';
+    for(const p of popups){p.t+=dt;const a=1-p.t/.6;if(a<=0)continue;
+      const sc=0.9+p.t*0.7,y=p.y-p.t*80;
+      uctx.save();uctx.globalAlpha=a;uctx.translate(p.x,y);uctx.scale(sc,sc);
+      uctx.strokeText(p.txt,0,0);uctx.fillText(p.txt,0,0);uctx.restore()}
+    popups=popups.filter(p=>p.t<.6);
+  }
   if(comboT>0){comboT-=dt;if(comboT<=0)combo=0}
-  $('combo').textContent=combo>1?`Combo x${combo}`:'';
-  $('status').textContent=target.ok?(target.kind==='face'?'':'Đã thấy thú cưng 🐱'):'Đưa mặt (hoặc mèo/chó) vào khung hình...';
+  const ct=combo>1?`Combo x${combo}`:'';if(ct!==comboTxt){comboTxt=ct;$('combo').textContent=ct}
+  const st=target.ok?(target.kind==='face'?'':'Đã thấy thú cưng 🐱'):'Đưa mặt (hoặc mèo/chó) vào khung hình...';
+  if(st!==statusTxt){statusTxt=st;$('status').textContent=st}
 }
 
 // ---------- Boot ----------
@@ -380,12 +421,12 @@ $('go').onclick=async()=>{
     const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
     faceLm=await FaceLandmarker.createFromOptions(fs,{baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",delegate:"GPU"},runningMode:"VIDEO",numFaces:1});
     ObjectDetector.createFromOptions(fs,{baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite",delegate:"GPU"},runningMode:"VIDEO",scoreThreshold:.3,maxResults:5}).then(o=>objDet=o).catch(()=>{});
-    $('start').style.display='none';$('flip').style.display='block';
+    $('start').style.display='none';$('bar').style.display='flex';
     requestAnimationFrame(loop);
   }catch(e){$('err').textContent='Lỗi: '+e.message+' (cần cấp quyền camera và chạy qua http://localhost hoặc https)';$('go').disabled=false;$('go').textContent='Thử lại'}
 };
-$('flip').onclick=async e=>{e.stopPropagation();facing=facing==='user'?'environment':'user';target.ok=false;await startCamera()};
-$('flip').addEventListener('pointerdown',e=>e.stopPropagation());
+$('flip').onclick=async()=>{facing=facing==='user'?'environment':'user';target.ok=false;bruises=[];hits=[];await startCamera()};
+$('reset').onclick=()=>{bruises=[];hits=[];score=0;combo=0;$('score').textContent='Điểm: 0'};
 </script>
 </body>
 </html>
