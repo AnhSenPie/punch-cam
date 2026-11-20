@@ -110,7 +110,12 @@ function punch(side){
   const g=fist[side]; if(g.state!=='idle') return;
   g.state='out'; g.t=0;
   const tg=target.ok?target:{x:W/2,y:H*0.4,w:200,h:260};
-  g.tx=tg.x+(Math.random()-.5)*tg.w*0.3; g.ty=tg.y+(Math.random()-.5)*tg.h*0.2;
+  // găng trái đánh vào má bên trái màn hình, găng phải vào má bên phải
+  const ch=target.ok?[...target.cheeks].sort((a,b)=>a[0]-b[0])[side]:[tg.x+(side?1:-1)*tg.w*.25,tg.y];
+  g.tx=ch[0]+(Math.random()-.5)*tg.w*0.08; g.ty=ch[1]-tg.h*0.05+(Math.random()-.5)*tg.h*0.08;
+  const dx=g.tx-g.baseX(),dy=g.ty-(H+30),dl=Math.hypot(dx,dy)||1; g.dx=dx/dl; g.dy=dy/dl;
+  // găng to lên cỡ khuôn mặt khi chạm, như clip demo
+  g.es=Math.max(0.7,Math.min(2.4,tg.w*0.85/(96*(W<500?.9:1.15))));
   g.hit=target.ok;
   woosh();
 }
@@ -118,7 +123,7 @@ function onHit(g,side){
   if(!g.hit) return;
   combo++; comboT=1.5; score+=10*Math.min(combo,10);
   redness=Math.min(1,redness+0.25); shake=14;
-  hitFx={t:0,dir:side===0?1:-1,x:g.tx,y:g.ty};
+  hitFx={t:0,side:side===0?1:-1,x:g.tx,y:g.ty,dx:g.dx,dy:g.dy};
   popups.push({x:g.tx,y:g.ty-40,t:0,txt:['BỐP!','POW!','BÙM!','CHÁT!'][Math.random()*4|0]});
   thump();
   if(navigator.vibrate) navigator.vibrate(40);
@@ -151,9 +156,9 @@ function drawSpring(x0,y0,x1,y1,s,color){
 function drawGlove(x,y,ang,s,g){
   ctx.save();ctx.translate(x,y);ctx.rotate(ang+Math.PI/2);ctx.scale(s,s);
   // cuff (ở dưới, phía lò xo)
-  ctx.fillStyle='#3a3f9e';ctx.fillRect(-34,40,68,50);
-  ctx.fillStyle='#ff4f7a';for(let i=0;i<5;i++)ctx.fillRect(-34+i*14,40,7,50);
-  ctx.fillStyle='#ffd23f';star(0,58,13);
+  const cg=ctx.createLinearGradient(-34,0,34,0);cg.addColorStop(0,g.dark);cg.addColorStop(.5,g.color);cg.addColorStop(1,g.dark);
+  ctx.fillStyle=cg;ctx.beginPath();ctx.roundRect(-34,40,68,50,8);ctx.fill();
+  ctx.fillStyle='#fff3';ctx.fillRect(-34,46,68,5);
   // fist
   const gr=ctx.createLinearGradient(-50,-70,50,50);gr.addColorStop(0,lighten(g.color));gr.addColorStop(1,g.dark);
   ctx.fillStyle=gr;ctx.strokeStyle='#0004';ctx.lineWidth=3;
@@ -165,7 +170,6 @@ function drawGlove(x,y,ang,s,g){
   ctx.restore();
 }
 function lighten(c){return c==='#e53935'?'#ff8a80':'#8fd0ff'}
-function star(cx,cy,r){ctx.beginPath();for(let i=0;i<10;i++){const a=-Math.PI/2+i*Math.PI/5,rr=i%2?r*.45:r;ctx.lineTo(cx+Math.cos(a)*rr,cy+Math.sin(a)*rr)}ctx.closePath();ctx.fill()}
 
 const tmp=document.createElement('canvas'),tctx=tmp.getContext('2d');
 function drawVideo(){
@@ -173,23 +177,63 @@ function drawVideo(){
   if(mirrored()){ctx.translate(W,0);ctx.scale(-1,1)}
   ctx.drawImage(video,m.ox,m.oy,m.vw*m.s,m.vh*m.s);ctx.restore();
 }
+// Vẽ 1 tam giác có texture (biến đổi affine từ toạ độ nguồn sang đích)
+function texTri(img,s0,s1,s2,d0,d1,d2){
+  const ux=s1[0]-s0[0],uy=s1[1]-s0[1],vx=s2[0]-s0[0],vy=s2[1]-s0[1];
+  const det=ux*vy-uy*vx; if(Math.abs(det)<1e-6) return;
+  const Ux=d1[0]-d0[0],Uy=d1[1]-d0[1],Vx=d2[0]-d0[0],Vy=d2[1]-d0[1];
+  const a=(Ux*vy-Vx*uy)/det,c=(Vx*ux-Ux*vx)/det,b=(Uy*vy-Vy*uy)/det,d=(Vy*ux-Uy*vx)/det;
+  const e=d0[0]-a*s0[0]-c*s0[1],f=d0[1]-b*s0[0]-d*s0[1];
+  // nới nhẹ tam giác ra 0.6px để không hở đường nối
+  const mx=(d0[0]+d1[0]+d2[0])/3,my=(d0[1]+d1[1]+d2[1])/3,ex=p=>{const l=Math.hypot(p[0]-mx,p[1]-my)||1;return [p[0]+(p[0]-mx)/l*.6,p[1]+(p[1]-my)/l*.6]};
+  const p0=ex(d0),p1=ex(d1),p2=ex(d2);
+  ctx.save();ctx.beginPath();ctx.moveTo(p0[0],p0[1]);ctx.lineTo(p1[0],p1[1]);ctx.lineTo(p2[0],p2[1]);ctx.closePath();ctx.clip();
+  ctx.transform(a,b,c,d,e,f);ctx.drawImage(img,0,0);ctx.restore();
+}
+const GN=14;
 function drawWarp(dt){
   if(!hitFx||!target.ok) return;
-  hitFx.t+=dt/0.45; if(hitFx.t>=1){hitFx=null;return}
-  const k=Math.sin(hitFx.t*Math.PI)*Math.exp(-hitFx.t*1.5);
-  const rw=target.w*1.5,rh=target.h*1.5,rx=target.x-rw/2,ry=target.y-rh/2;
-  const sx=Math.max(0,rx),sy=Math.max(0,ry),sw=Math.min(W-sx,rw),sh=Math.min(H-sy,rh);
-  if(sw<8||sh<8) return;
-  tmp.width=sw*DPR;tmp.height=sh*DPR;
+  hitFx.t+=dt/0.85; if(hitFx.t>=1){hitFx=null;return}
+  const t=hitFx.t;
+  // ăn đòn rất nhanh, giữ lúc găng ghì vào má, rồi đầu nảy lại tắt dần
+  const k=t<0.08? ease(t/0.08) : t<0.22? 1 : Math.exp(-(t-0.22)*6)*Math.cos((t-0.22)*15);
+  const R=Math.max(target.w,target.h)*0.62;          // vùng ảnh hưởng của cú đấm
+  const rw=R*3.6,rh=R*3.6,sx=Math.max(0,target.x-rw/2),sy=Math.max(0,target.y-rh/2);
+  const sw=Math.min(W-sx,rw),sh=Math.min(H-sy,rh);
+  if(sw<16||sh<16) return;
+  tmp.width=Math.round(sw*DPR);tmp.height=Math.round(sh*DPR);
   tctx.drawImage(cv,sx*DPR,sy*DPR,sw*DPR,sh*DPR,0,0,tmp.width,tmp.height);
-  ctx.save();
-  ctx.beginPath();ctx.ellipse(target.x,target.y,target.w*.62,target.h*.62,0,0,7);ctx.clip();
-  ctx.translate(target.x+hitFx.dir*k*target.w*0.35,target.y);
-  ctx.rotate(hitFx.dir*k*0.25);
-  ctx.scale(1-k*0.38,1+k*0.12);
-  ctx.translate(-target.x,-target.y);
-  ctx.drawImage(tmp,sx,sy,sw,sh);
-  ctx.restore();
+  const P=[hitFx.x,hitFx.y],cx=target.x,cy=target.y,dx=hitFx.dx,dy=hitFx.dy;
+  const A=target.w*0.42*k,B=target.w*0.20*k,rot=hitFx.side*0.35*k;
+  const grid=[];
+  for(let j=0;j<=GN;j++)for(let i=0;i<=GN;i++){
+    const X=sx+sw*i/GN,Y=sy+sh*j/GN;
+    const rx=X-P[0],ry=Y-P[1],r2=(rx*rx+ry*ry)/(R*R);
+    const f=Math.exp(-r2*2.2);                       // cục bộ quanh chỗ trúng đấm
+    const wide=Math.exp(-((X-cx)**2+(Y-cy)**2)/(R*R*5)); // cả cái đầu bị hất
+    // mép vùng vẽ phải đứng yên để khớp với video phía dưới
+    const ex=Math.min(i,GN-i)/(GN*.18),ey=Math.min(j,GN-j)/(GN*.18),edge=Math.min(1,ex,ey);
+    let nx=X,ny=Y;
+    nx+=dx*A*f;ny+=dy*A*f;                           // chỗ bị đấm lún theo hướng đấm
+    nx-=rx*0.32*k*f;ny-=ry*0.32*k*f;                 // da bị dồn vào điểm đấm (má móp)
+    nx+=dx*B*wide;ny+=dy*B*wide;                     // cả đầu bị đẩy
+    const qx=nx-cx,qy=ny-cy,cr=Math.cos(rot*wide),sr=Math.sin(rot*wide); // đầu nghiêng
+    nx=cx+qx*cr-qy*sr;ny=cy+qx*sr+qy*cr;
+    grid.push([X+(nx-X)*edge,Y+(ny-Y)*edge]);
+  }
+  const S=(i,j)=>[(i/GN)*tmp.width,(j/GN)*tmp.height];
+  for(let j=0;j<GN;j++)for(let i=0;i<GN;i++){
+    const g00=grid[j*(GN+1)+i],g10=grid[j*(GN+1)+i+1],g01=grid[(j+1)*(GN+1)+i],g11=grid[(j+1)*(GN+1)+i+1];
+    texTri(tmp,S(i,j),S(i+1,j),S(i,j+1),g00,g10,g01);
+    texTri(tmp,S(i+1,j),S(i+1,j+1),S(i,j+1),g10,g11,g01);
+  }
+  // vết đỏ tại chỗ trúng đấm, đi theo da bị biến dạng
+  const mk=Math.max(0,k);
+  if(mk>0.02){
+    const px=P[0]+dx*A*1.0,py=P[1]+dy*A*1.0,r=R*0.55,gr=ctx.createRadialGradient(px,py,0,px,py,r);
+    gr.addColorStop(0,`rgba(255,50,70,${.55*Math.min(1,mk)})`);gr.addColorStop(1,'rgba(255,50,70,0)');
+    ctx.fillStyle=gr;ctx.fillRect(px-r,py-r,r*2,r*2);
+  }
 }
 function drawCheeks(){
   if(!target.ok||redness<=0.01) return;
@@ -202,16 +246,21 @@ function drawCheeks(){
 function drawGloves(dt){
   fist.forEach((g,i)=>{
     const bx=g.baseX(),by=H+30,rx=g.restX(),ry=H*0.80;
+    const gs=W<500?.9:1.15, es=g.es||1;
     let px=rx,py=ry,sc=1;
-    if(g.state==='out'){g.t+=dt/0.10;const f=ease(Math.min(g.t,1));px=rx+(g.tx-rx)*f;py=ry+(g.ty-ry)*f;sc=1-0.45*f;
-      if(g.t>=1){g.state='back';g.t=0;onHit(g,i)}}
-    else if(g.state==='back'){g.t+=dt/0.32;const f=ease(Math.min(g.t,1)),e=1-f;
-      px=rx+(g.tx-rx)*e;py=ry+(g.ty-ry)*e;sc=1-0.45*e;
+    if(g.state==='out'){g.t+=dt/0.09;const f=ease(Math.min(g.t,1));px=rx+(g.tx-rx)*f;py=ry+(g.ty-ry)*f;sc=1+(es-1)*f;
+      if(g.t>=1){g.state='hold';g.t=0;onHit(g,i)}}
+    else if(g.state==='hold'){ // găng ghì vào má một nhịp, như clip
+      g.t+=dt/0.12;const p=Math.sin(Math.min(g.t,1)*Math.PI);
+      px=g.tx+g.dx*p*target.w*0.10;py=g.ty+g.dy*p*target.w*0.10;sc=es;
+      if(g.t>=1){g.state='back';g.t=0}}
+    else if(g.state==='back'){g.t+=dt/0.30;const f=ease(Math.min(g.t,1)),e=1-f;
+      px=rx+(g.tx-rx)*e;py=ry+(g.ty-ry)*e;sc=1+(es-1)*e;
       // dao động lò xo khi về
       const w=Math.sin(g.t*14)*(1-f)*18;py+=w;if(g.t>=1)g.state='idle'}
-    const ang=Math.atan2(py-by,px-bx);
-    drawSpring(bx,by,px-Math.cos(ang)*70*sc,py-Math.sin(ang)*70*sc+20*sc,sc,'#9aa0aa');
-    drawGlove(px,py,ang,sc*(W<500?.9:1.15),g);
+    const ang=Math.atan2(py-by,px-bx),s=sc*gs;
+    drawSpring(bx,by,px-Math.cos(ang)*88*s,py-Math.sin(ang)*88*s,Math.max(.8,s*.8),'#9aa0aa');
+    drawGlove(px,py,ang,s,g);
   });
 }
 
