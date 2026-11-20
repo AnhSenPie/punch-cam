@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>Punch Cam - Găng đấm lò xo AR</title>
 <style>
-  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif;touch-action:none;user-select:none}
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
   canvas{position:fixed;inset:0;width:100%;height:100%}
+  #g3,#ui{pointer-events:none}
   #hud{position:fixed;top:12px;left:0;right:0;display:flex;justify-content:space-between;padding:0 16px;color:#fff;font-weight:800;font-size:22px;text-shadow:0 2px 6px #000;pointer-events:none}
   #status{position:fixed;top:48px;left:0;right:0;text-align:center;color:#fff;font-size:14px;text-shadow:0 1px 4px #000;pointer-events:none}
   #flip{position:fixed;top:10px;left:50%;transform:translateX(-50%);padding:6px 14px;border-radius:20px;border:0;background:#0008;color:#fff;font-size:14px}
@@ -14,29 +15,99 @@
   #start button{font-size:22px;padding:14px 36px;border:0;border-radius:14px;background:#e53935;color:#fff;font-weight:800}
   #start p{max-width:360px;line-height:1.5;margin:0;opacity:.9}
 </style>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}
+</script>
 </head>
 <body>
 <canvas id="c"></canvas>
+<canvas id="g3"></canvas>
+<canvas id="ui"></canvas>
 <video id="v" playsinline muted style="display:none"></video>
 <div id="hud"><span id="score">Điểm: 0</span><span id="combo"></span></div>
 <div id="status"></div>
 <button id="flip" style="display:none">Đổi camera</button>
 <div id="start">
   <h1 style="margin:0">🥊 Punch Cam</h1>
-  <p>Bật camera, hướng vào mặt bạn (hoặc con mèo/chó). Chạm nửa trái màn hình = găng đỏ đấm, nửa phải = găng xanh. Phím <b>A</b>/<b>L</b> trên máy tính.</p>
+  <p>Bật camera, hướng vào mặt bạn (hoặc con mèo/chó). Chạm nửa trái màn hình = găng đỏ đấm, nửa phải = găng xanh. Bấm liên tục để đấm liên hoàn. Phím <b>A</b>/<b>L</b> trên máy tính.</p>
   <button id="go">Bắt đầu</button>
   <div id="err" style="color:#ff8a80"></div>
 </div>
 
 <script type="module">
 import {FilesetResolver, FaceLandmarker, ObjectDetector} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+import * as THREE from 'three';
+import {RoomEnvironment} from 'three/addons/environments/RoomEnvironment.js';
 
 const $ = id => document.getElementById(id);
 const cv = $('c'), ctx = cv.getContext('2d');
+const ui = $('ui'), uctx = ui.getContext('2d');
 const video = $('v');
 let W=0,H=0,DPR=Math.min(devicePixelRatio||1,2);
-function resize(){W=innerWidth;H=innerHeight;cv.width=W*DPR;cv.height=H*DPR;ctx.setTransform(DPR,0,0,DPR,0,0)}
+
+// ---------- Three.js: găng 3D ----------
+const renderer=new THREE.WebGLRenderer({canvas:$('g3'),alpha:true,antialias:true});
+renderer.setPixelRatio(DPR);renderer.setClearColor(0x000000,0);
+renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=1.05;
+const scene=new THREE.Scene();
+const pmrem=new THREE.PMREMGenerator(renderer);
+scene.environment=pmrem.fromScene(new RoomEnvironment(),0.04).texture;
+scene.environmentIntensity=0.9;
+// camera trực giao theo pixel màn hình: x=0..W, y=0..-H
+const cam=new THREE.OrthographicCamera(0,1,0,-1,-4000,4000);cam.position.z=2000;
+const key=new THREE.DirectionalLight(0xffffff,2.4);key.position.set(-500,900,1200);scene.add(key);
+const rim=new THREE.DirectionalLight(0xffffff,1.0);rim.position.set(800,-200,-600);scene.add(rim);
+
+function resize(){
+  W=innerWidth;H=innerHeight;
+  for(const c of[cv,ui]){c.width=W*DPR;c.height=H*DPR}
+  ctx.setTransform(DPR,0,0,DPR,0,0);uctx.setTransform(DPR,0,0,DPR,0,0);
+  renderer.setSize(W,H,false);cam.right=W;cam.bottom=-H;cam.updateProjectionMatrix();
+}
 addEventListener('resize',resize);resize();
+
+function makeGlove(color,thumbSide){
+  const root=new THREE.Group();          // xoay theo hướng đấm (trục Z màn hình)
+  const tilt=new THREE.Group();root.add(tilt); // nghiêng vào trong màn hình -> chiều sâu
+  const leather=new THREE.MeshPhysicalMaterial({color,roughness:.32,clearcoat:1,clearcoatRoughness:.12,sheen:.4,sheenRoughness:.5});
+  const cuffMat=new THREE.MeshPhysicalMaterial({color:new THREE.Color(color).multiplyScalar(.72),roughness:.5,clearcoat:.5,clearcoatRoughness:.3});
+  const trim=new THREE.MeshStandardMaterial({color:0xf4f4f4,roughness:.55});
+  const metal=new THREE.MeshStandardMaterial({color:0xc9ced6,metalness:1,roughness:.28});
+  const sph=new THREE.SphereGeometry(1,48,32);
+  const add=(geo,mat,pos,scale,rot)=>{const m=new THREE.Mesh(geo,mat);m.position.set(...pos);if(scale)m.scale.set(...scale);if(rot)m.rotation.set(...rot);tilt.add(m);return m};
+  add(sph,leather,[0,10,0],[58,64,52]);                   // thân găng
+  add(sph,leather,[0,46,4],[55,38,50]);                   // phần đốt tay phía trước
+  add(sph,leather,[0,24,34],[46,46,22]);                  // ngón tay cuộn lại phía mu
+  add(new THREE.CapsuleGeometry(17,34,8,24),leather,[thumbSide*52,0,16],null,[0.25,0,thumbSide*0.42]); // ngón cái
+  add(new THREE.CylinderGeometry(38,33,36,48),cuffMat,[0,-52,0]);   // cổ găng (màu trơn)
+  add(new THREE.TorusGeometry(39,5.5,16,64),trim,[0,-36,0],null,[Math.PI/2,0,0]); // viền trắng
+  add(new THREE.CylinderGeometry(22,22,10,32),metal,[0,-74,0]);     // đế gắn lò xo
+  const anchor=new THREE.Object3D();anchor.position.set(0,-78,0);tilt.add(anchor);
+  scene.add(root);
+  const spring=new THREE.Mesh(new THREE.BufferGeometry(),metal);scene.add(spring);
+  return {root,tilt,anchor,spring};
+}
+class Helix extends THREE.Curve{
+  constructor(a,b,r,coils){super();this.a=a;this.b=b;this.r=r;this.coils=coils;
+    this.ax=b.clone().sub(a);const l=this.ax.length()||1;
+    this.n1=new THREE.Vector3(-this.ax.y/l,this.ax.x/l,0);this.n2=new THREE.Vector3(0,0,1)}
+  getPoint(t,o=new THREE.Vector3()){
+    const an=t*this.coils*Math.PI*2,r=this.r*(t<.04||t>.96?.6:1);
+    return o.copy(this.a).addScaledVector(this.ax,t).addScaledVector(this.n1,Math.cos(an)*r).addScaledVector(this.n2,Math.sin(an)*r)}
+}
+const tmpV=new THREE.Vector3();
+function poseGlove(m,px,py,ang,s,tiltX,roll,bx,by){
+  m.root.position.set(px,-py,0);
+  m.root.rotation.z=-ang-Math.PI/2;
+  m.root.scale.setScalar(s);
+  m.tilt.rotation.set(tiltX,roll,0);
+  m.root.updateMatrixWorld(true);
+  m.anchor.getWorldPosition(tmpV);
+  const a=new THREE.Vector3(bx,-by,-60);
+  const r=Math.max(9,15*s);
+  m.spring.geometry.dispose();
+  m.spring.geometry=new THREE.TubeGeometry(new Helix(a,tmpV.clone(),r,11),180,Math.max(2.6,3.6*s),8,false);
+}
 
 let facing='user', stream=null, faceLm=null, objDet=null, audio=null;
 
@@ -89,7 +160,7 @@ function detect(){
     if(best){
       const b=best.boundingBox;
       const [ax,ay]=toScreen(b.originX,b.originY,m),[bx,by]=toScreen(b.originX+b.width,b.originY+b.height,m);
-      const w=Math.abs(bx-ax),h=Math.abs(by-ay),cx=(ax+bx)/2,cy=(ay+by)/2;
+      const w=Math.abs(bx-ax),h=Math.abs(by-ay),cx=(ax+bx)/2;
       // đầu thú cưng ~ nửa trên của khung
       const hw=w*0.5,hh=h*0.5,hx=cx,hy=Math.min(ay,by)+hh*0.6;
       setTarget({x:hx,y:hy,w:hw,h:hh},'pet',[[hx-hw*.3,hy+hh*.1],[hx+hw*.3,hy+hh*.1]]);
@@ -102,75 +173,64 @@ function detect(){
 // ---------- Game state ----------
 let score=0, combo=0, comboT=0, redness=0, shake=0;
 const fist=[
-  {key:'l',color:'#e53935',dark:'#a31515',baseX:()=>W*0.18,restX:()=>W*0.24,t:0,state:'idle',tx:0,ty:0},
-  {key:'r',color:'#2f8fdc',dark:'#16609c',baseX:()=>W*0.82,restX:()=>W*0.76,t:0,state:'idle',tx:0,ty:0},
+  {color:'#e53935',baseX:()=>W*0.16,restX:()=>W*0.25,state:'idle',t:0,queue:0},
+  {color:'#2f8fdc',baseX:()=>W*0.84,restX:()=>W*0.75,state:'idle',t:0,queue:0},
 ];
-let hitFx=null, popups=[];
-function punch(side){
-  const g=fist[side]; if(g.state!=='idle') return;
+fist.forEach((g,i)=>g.mesh=makeGlove(g.color,i===0?1:-1));
+let hits=[], popups=[];
+const gloveScale=()=>Math.min(1.5,Math.max(.95,W*.27/116));
+const restY=()=>H*0.80, baseY=()=>H+40;
+
+function launch(side){
+  const g=fist[side];
+  // xuất phát từ vị trí hiện tại (có thể đang giữa chừng) -> đấm liên hoàn mượt
+  g.fx=g.px??g.restX(); g.fy=g.py??restY(); g.fs=g.sc??1;
   g.state='out'; g.t=0;
   const tg=target.ok?target:{x:W/2,y:H*0.4,w:200,h:260};
   // găng trái đánh vào má bên trái màn hình, găng phải vào má bên phải
   const ch=target.ok?[...target.cheeks].sort((a,b)=>a[0]-b[0])[side]:[tg.x+(side?1:-1)*tg.w*.25,tg.y];
-  g.tx=ch[0]+(Math.random()-.5)*tg.w*0.08; g.ty=ch[1]-tg.h*0.05+(Math.random()-.5)*tg.h*0.08;
-  const dx=g.tx-g.baseX(),dy=g.ty-(H+30),dl=Math.hypot(dx,dy)||1; g.dx=dx/dl; g.dy=dy/dl;
+  g.tx=ch[0]+(Math.random()-.5)*tg.w*0.10; g.ty=ch[1]-tg.h*0.05+(Math.random()-.5)*tg.h*0.10;
+  const dx=g.tx-g.baseX(),dy=g.ty-baseY(),dl=Math.hypot(dx,dy)||1; g.dx=dx/dl; g.dy=dy/dl;
   // găng to lên cỡ khuôn mặt khi chạm, như clip demo
-  g.es=Math.max(0.7,Math.min(2.4,tg.w*0.85/(96*(W<500?.9:1.15))));
+  g.es=Math.max(0.7,Math.min(2.0,tg.w*0.62/(116*gloveScale())));
   g.hit=target.ok;
   woosh();
+}
+function punch(side){
+  const g=fist[side];
+  // đang lao ra/ghì vào má -> xếp hàng cú tiếp theo; đang rút về/đứng yên -> đấm ngay
+  if(g.state==='out'||g.state==='hold'){g.queue=Math.min(3,g.queue+1);return}
+  launch(side);
 }
 function onHit(g,side){
   if(!g.hit) return;
   combo++; comboT=1.5; score+=10*Math.min(combo,10);
-  redness=Math.min(1,redness+0.25); shake=14;
-  hitFx={t:0,side:side===0?1:-1,x:g.tx,y:g.ty,dx:g.dx,dy:g.dy};
-  popups.push({x:g.tx,y:g.ty-40,t:0,txt:['BỐP!','POW!','BÙM!','CHÁT!'][Math.random()*4|0]});
+  redness=Math.min(1,redness+0.2); shake=Math.min(22,shake+12);
+  hits.push({t:0,side:side===0?1:-1,x:g.tx,y:g.ty,dx:g.dx,dy:g.dy});
+  if(hits.length>5) hits.shift();
+  const pw=target.ok?target.w:200;
+  popups.push({x:g.tx+(side===0?-1:1)*pw*0.45+(Math.random()-.5)*30,y:g.ty-pw*0.35+(Math.random()-.5)*40,t:0,txt:['BỐP!','POW!','BÙM!','CHÁT!'][Math.random()*4|0]});
   thump();
-  if(navigator.vibrate) navigator.vibrate(40);
+  if(navigator.vibrate) navigator.vibrate(35);
   $('score').textContent='Điểm: '+score;
 }
-function press(x){punch(x<W/2?0:1)}
-cv.addEventListener('pointerdown',e=>{e.preventDefault();audioInit();press(e.clientX)});
-addEventListener('keydown',e=>{const k=e.key.toLowerCase();if(k==='a'||k==='arrowleft')punch(0);if(k==='l'||k==='arrowright')punch(1);if(k===' ')punch(Math.random()<.5?0:1)});
+cv.addEventListener('pointerdown',e=>{e.preventDefault();audioInit();punch(e.clientX<W/2?0:1)});
+addEventListener('keydown',e=>{if(e.repeat)return;const k=e.key.toLowerCase();if(k==='a'||k==='arrowleft')punch(0);if(k==='l'||k==='arrowright')punch(1);if(k===' ')punch(Math.random()<.5?0:1)});
 
 // ---------- Audio (synth) ----------
 function audioInit(){if(!audio){audio=new (window.AudioContext||window.webkitAudioContext)()} if(audio.state==='suspended')audio.resume()}
 function woosh(){if(!audio)return;const t=audio.currentTime,o=audio.createOscillator(),g=audio.createGain();
   o.type='sawtooth';o.frequency.setValueAtTime(500,t);o.frequency.exponentialRampToValueAtTime(150,t+.12);
-  g.gain.setValueAtTime(.08,t);g.gain.exponentialRampToValueAtTime(.001,t+.14);o.connect(g).connect(audio.destination);o.start(t);o.stop(t+.15)}
+  g.gain.setValueAtTime(.06,t);g.gain.exponentialRampToValueAtTime(.001,t+.14);o.connect(g).connect(audio.destination);o.start(t);o.stop(t+.15)}
 function thump(){if(!audio)return;const t=audio.currentTime,o=audio.createOscillator(),g=audio.createGain();
-  o.type='sine';o.frequency.setValueAtTime(180,t);o.frequency.exponentialRampToValueAtTime(40,t+.2);
-  g.gain.setValueAtTime(.9,t);g.gain.exponentialRampToValueAtTime(.001,t+.25);o.connect(g).connect(audio.destination);o.start(t);o.stop(t+.3);
+  o.type='sine';o.frequency.setValueAtTime(170+Math.random()*30,t);o.frequency.exponentialRampToValueAtTime(40,t+.2);
+  g.gain.setValueAtTime(.8,t);g.gain.exponentialRampToValueAtTime(.001,t+.25);o.connect(g).connect(audio.destination);o.start(t);o.stop(t+.3);
   const n=audio.createBufferSource(),b=audio.createBuffer(1,audio.sampleRate*.08,audio.sampleRate),d=b.getChannelData(0);
   for(let i=0;i<d.length;i++)d[i]=(Math.random()*2-1)*(1-i/d.length);
-  const ng=audio.createGain();ng.gain.value=.5;n.buffer=b;n.connect(ng).connect(audio.destination);n.start(t)}
+  const ng=audio.createGain();ng.gain.value=.45;n.buffer=b;n.connect(ng).connect(audio.destination);n.start(t)}
 
 // ---------- Drawing ----------
 const ease=t=>1-Math.pow(1-t,3);
-function drawSpring(x0,y0,x1,y1,s,color){
-  const dx=x1-x0,dy=y1-y0,len=Math.hypot(dx,dy)||1,nx=-dy/len,ny=dx/len,coils=12,amp=13*s;
-  ctx.save();ctx.lineWidth=5*s;ctx.lineJoin='round';ctx.strokeStyle=color;ctx.beginPath();ctx.moveTo(x0,y0);
-  for(let i=1;i<=coils*2;i++){const f=i/(coils*2),sg=i%2?1:-1;ctx.lineTo(x0+dx*f+nx*amp*sg,y0+dy*f+ny*amp*sg)}
-  ctx.lineTo(x1,y1);ctx.stroke();ctx.restore();
-}
-function drawGlove(x,y,ang,s,g){
-  ctx.save();ctx.translate(x,y);ctx.rotate(ang+Math.PI/2);ctx.scale(s,s);
-  // cuff (ở dưới, phía lò xo)
-  const cg=ctx.createLinearGradient(-34,0,34,0);cg.addColorStop(0,g.dark);cg.addColorStop(.5,g.color);cg.addColorStop(1,g.dark);
-  ctx.fillStyle=cg;ctx.beginPath();ctx.roundRect(-34,40,68,50,8);ctx.fill();
-  ctx.fillStyle='#fff3';ctx.fillRect(-34,46,68,5);
-  // fist
-  const gr=ctx.createLinearGradient(-50,-70,50,50);gr.addColorStop(0,lighten(g.color));gr.addColorStop(1,g.dark);
-  ctx.fillStyle=gr;ctx.strokeStyle='#0004';ctx.lineWidth=3;
-  ctx.beginPath();ctx.ellipse(0,-12,48,62,0,0,7);ctx.fill();ctx.stroke();
-  ctx.beginPath();ctx.ellipse(-44,6,18,30,.3,0,7);ctx.fill();ctx.stroke(); // ngón cái
-  ctx.strokeStyle='#0003';ctx.lineWidth=3;
-  for(const dx of[-16,0,16]){ctx.beginPath();ctx.moveTo(dx,-70);ctx.quadraticCurveTo(dx+3,-45,dx,-30);ctx.stroke()}
-  ctx.fillStyle='#fff4';ctx.beginPath();ctx.ellipse(14,-38,14,26,.3,0,7);ctx.fill();
-  ctx.restore();
-}
-function lighten(c){return c==='#e53935'?'#ff8a80':'#8fd0ff'}
-
 const tmp=document.createElement('canvas'),tctx=tmp.getContext('2d');
 function drawVideo(){
   const m=map();ctx.save();
@@ -191,34 +251,38 @@ function texTri(img,s0,s1,s2,d0,d1,d2){
   ctx.transform(a,b,c,d,e,f);ctx.drawImage(img,0,0);ctx.restore();
 }
 const GN=14;
+// ăn đòn rất nhanh, giữ lúc găng ghì vào má, rồi đầu nảy lại tắt dần
+const hitK=t=>t<0.08? ease(t/0.08) : t<0.22? 1 : Math.exp(-(t-0.22)*6)*Math.cos((t-0.22)*15);
 function drawWarp(dt){
-  if(!hitFx||!target.ok) return;
-  hitFx.t+=dt/0.85; if(hitFx.t>=1){hitFx=null;return}
-  const t=hitFx.t;
-  // ăn đòn rất nhanh, giữ lúc găng ghì vào má, rồi đầu nảy lại tắt dần
-  const k=t<0.08? ease(t/0.08) : t<0.22? 1 : Math.exp(-(t-0.22)*6)*Math.cos((t-0.22)*15);
+  for(const h of hits) h.t+=dt/0.85;
+  hits=hits.filter(h=>h.t<1);
+  if(!hits.length||!target.ok) return;
   const R=Math.max(target.w,target.h)*0.62;          // vùng ảnh hưởng của cú đấm
   const rw=R*3.6,rh=R*3.6,sx=Math.max(0,target.x-rw/2),sy=Math.max(0,target.y-rh/2);
   const sw=Math.min(W-sx,rw),sh=Math.min(H-sy,rh);
   if(sw<16||sh<16) return;
   tmp.width=Math.round(sw*DPR);tmp.height=Math.round(sh*DPR);
   tctx.drawImage(cv,sx*DPR,sy*DPR,sw*DPR,sh*DPR,0,0,tmp.width,tmp.height);
-  const P=[hitFx.x,hitFx.y],cx=target.x,cy=target.y,dx=hitFx.dx,dy=hitFx.dy;
-  const A=target.w*0.42*k,B=target.w*0.20*k,rot=hitFx.side*0.35*k;
+  const cx=target.x,cy=target.y;
+  // các cú đấm liên tiếp cộng dồn, nhưng giới hạn để mặt không bị gập
+  const hs=hits.map(h=>{const k=hitK(h.t);return {...h,k,A:target.w*0.42*k,B:target.w*0.20*k}});
+  const norm=Math.min(1,1.3/hs.reduce((s,h)=>s+Math.abs(h.k),0.0001));
   const grid=[];
   for(let j=0;j<=GN;j++)for(let i=0;i<=GN;i++){
     const X=sx+sw*i/GN,Y=sy+sh*j/GN;
-    const rx=X-P[0],ry=Y-P[1],r2=(rx*rx+ry*ry)/(R*R);
-    const f=Math.exp(-r2*2.2);                       // cục bộ quanh chỗ trúng đấm
     const wide=Math.exp(-((X-cx)**2+(Y-cy)**2)/(R*R*5)); // cả cái đầu bị hất
     // mép vùng vẽ phải đứng yên để khớp với video phía dưới
     const ex=Math.min(i,GN-i)/(GN*.18),ey=Math.min(j,GN-j)/(GN*.18),edge=Math.min(1,ex,ey);
-    let nx=X,ny=Y;
-    nx+=dx*A*f;ny+=dy*A*f;                           // chỗ bị đấm lún theo hướng đấm
-    nx-=rx*0.32*k*f;ny-=ry*0.32*k*f;                 // da bị dồn vào điểm đấm (má móp)
-    nx+=dx*B*wide;ny+=dy*B*wide;                     // cả đầu bị đẩy
-    const qx=nx-cx,qy=ny-cy,cr=Math.cos(rot*wide),sr=Math.sin(rot*wide); // đầu nghiêng
-    nx=cx+qx*cr-qy*sr;ny=cy+qx*sr+qy*cr;
+    let ox=0,oy=0,rot=0;
+    for(const h of hs){
+      const rx=X-h.x,ry=Y-h.y,f=Math.exp(-(rx*rx+ry*ry)/(R*R)*2.2); // cục bộ quanh chỗ trúng
+      ox+=h.dx*h.A*f-rx*0.32*h.k*f+h.dx*h.B*wide;  // lún theo hướng đấm + má móp + đầu bị đẩy
+      oy+=h.dy*h.A*f-ry*0.32*h.k*f+h.dy*h.B*wide;
+      rot+=h.side*0.35*h.k*wide;
+    }
+    ox*=norm;oy*=norm;rot*=norm;
+    const qx=X+ox-cx,qy=Y+oy-cy,cr=Math.cos(rot),sr=Math.sin(rot); // đầu nghiêng
+    const nx=cx+qx*cr-qy*sr,ny=cy+qx*sr+qy*cr;
     grid.push([X+(nx-X)*edge,Y+(ny-Y)*edge]);
   }
   const S=(i,j)=>[(i/GN)*tmp.width,(j/GN)*tmp.height];
@@ -228,10 +292,10 @@ function drawWarp(dt){
     texTri(tmp,S(i+1,j),S(i+1,j+1),S(i,j+1),g10,g11,g01);
   }
   // vết đỏ tại chỗ trúng đấm, đi theo da bị biến dạng
-  const mk=Math.max(0,k);
-  if(mk>0.02){
-    const px=P[0]+dx*A*1.0,py=P[1]+dy*A*1.0,r=R*0.55,gr=ctx.createRadialGradient(px,py,0,px,py,r);
-    gr.addColorStop(0,`rgba(255,50,70,${.55*Math.min(1,mk)})`);gr.addColorStop(1,'rgba(255,50,70,0)');
+  for(const h of hs){
+    const mk=Math.max(0,h.k)*norm; if(mk<0.02) continue;
+    const px=h.x+h.dx*h.A*norm,py=h.y+h.dy*h.A*norm,r=R*0.55,gr=ctx.createRadialGradient(px,py,0,px,py,r);
+    gr.addColorStop(0,`rgba(255,50,70,${.5*Math.min(1,mk)})`);gr.addColorStop(1,'rgba(255,50,70,0)');
     ctx.fillStyle=gr;ctx.fillRect(px-r,py-r,r*2,r*2);
   }
 }
@@ -243,24 +307,41 @@ function drawCheeks(){
     ctx.fillStyle=g;ctx.fillRect(x-r,y-r,r*2,r*2);
   }
 }
-function drawGloves(dt){
+// bóng đổ mềm của găng lên mặt/nền -> tăng cảm giác chiều sâu
+function drawGloveShadows(){
+  for(const g of fist){
+    if(g.px==null) continue;
+    const s=g.sc*gloveScale(),near=g.state==='hold'?1:g.state==='out'?ease(Math.min(g.t,1)):0;
+    const ox=18*s*(1-near*.5),oy=30*s*(1-near*.5),r=62*s;
+    const gr=ctx.createRadialGradient(g.px+ox,g.py+oy,r*.2,g.px+ox,g.py+oy,r);
+    gr.addColorStop(0,`rgba(0,0,0,${.28+near*.2})`);gr.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=gr;ctx.fillRect(g.px+ox-r,g.py+oy-r,r*2,r*2);
+  }
+}
+function updateGloves(dt){
   fist.forEach((g,i)=>{
-    const bx=g.baseX(),by=H+30,rx=g.restX(),ry=H*0.80;
-    const gs=W<500?.9:1.15, es=g.es||1;
-    let px=rx,py=ry,sc=1;
-    if(g.state==='out'){g.t+=dt/0.09;const f=ease(Math.min(g.t,1));px=rx+(g.tx-rx)*f;py=ry+(g.ty-ry)*f;sc=1+(es-1)*f;
+    const bx=g.baseX(),by=baseY(),rx=g.restX(),ry=restY(),es=g.es||1;
+    let px=rx,py=ry,sc=1,reach=0;
+    if(g.state==='out'){g.t+=dt/0.085;const f=ease(Math.min(g.t,1));
+      px=g.fx+(g.tx-g.fx)*f;py=g.fy+(g.ty-g.fy)*f;sc=g.fs+(es-g.fs)*f;reach=f;
       if(g.t>=1){g.state='hold';g.t=0;onHit(g,i)}}
     else if(g.state==='hold'){ // găng ghì vào má một nhịp, như clip
-      g.t+=dt/0.12;const p=Math.sin(Math.min(g.t,1)*Math.PI);
-      px=g.tx+g.dx*p*target.w*0.10;py=g.ty+g.dy*p*target.w*0.10;sc=es;
-      if(g.t>=1){g.state='back';g.t=0}}
+      const dur=g.queue>0?0.05:0.12;g.t+=dt/dur;const p=Math.sin(Math.min(g.t,1)*Math.PI);
+      px=g.tx+g.dx*p*target.w*0.10;py=g.ty+g.dy*p*target.w*0.10;sc=es;reach=1;
+      if(g.t>=1){
+        if(g.queue>0){g.queue--;g.px=px;g.py=py;g.sc=sc;launch(i)}
+        else{g.state='back';g.t=0;g.fx=px;g.fy=py;g.fs=sc}}}
     else if(g.state==='back'){g.t+=dt/0.30;const f=ease(Math.min(g.t,1)),e=1-f;
-      px=rx+(g.tx-rx)*e;py=ry+(g.ty-ry)*e;sc=1+(es-1)*e;
+      px=rx+(g.fx-rx)*e;py=ry+(g.fy-ry)*e;sc=1+(g.fs-1)*e;reach=e;
       // dao động lò xo khi về
-      const w=Math.sin(g.t*14)*(1-f)*18;py+=w;if(g.t>=1)g.state='idle'}
-    const ang=Math.atan2(py-by,px-bx),s=sc*gs;
-    drawSpring(bx,by,px-Math.cos(ang)*88*s,py-Math.sin(ang)*88*s,Math.max(.8,s*.8),'#9aa0aa');
-    drawGlove(px,py,ang,s,g);
+      py+=Math.sin(g.t*14)*(1-f)*18;if(g.t>=1)g.state='idle'}
+    else{ // đứng yên: nhún nhẹ như đang thủ thế
+      const tt=performance.now()/1000;py+=Math.sin(tt*3+i*1.7)*4;px+=Math.cos(tt*2.3+i)*2}
+    g.px=px;g.py=py;g.sc=sc;
+    const ang=Math.atan2(py-by,px-bx),s=sc*gloveScale();
+    // khi lao ra, găng chúi vào trong màn hình và xoắn nhẹ như cú đấm thật
+    const side=i===0?1:-1;
+    poseGlove(g.mesh,px,py,ang,s,-0.25-0.35*reach,side*0.40*reach,bx,by);
   });
 }
 
@@ -269,16 +350,22 @@ function loop(now){
   requestAnimationFrame(loop);
   const dt=Math.min((now-last)/1000,.05);last=now;
   detect();
+  let shx=0,shy=0;
+  if(shake>0.3){shx=(Math.random()-.5)*shake;shy=(Math.random()-.5)*shake;shake*=0.85}
   ctx.setTransform(DPR,0,0,DPR,0,0);ctx.clearRect(0,0,W,H);
-  ctx.save();
-  if(shake>0.3){ctx.translate((Math.random()-.5)*shake,(Math.random()-.5)*shake);shake*=0.85}
-  drawVideo();drawWarp(dt);drawCheeks();drawGloves(dt);
-  for(const p of popups){p.t+=dt;const a=1-p.t/.7;if(a<=0)continue;
-    ctx.save();ctx.globalAlpha=a;ctx.font='900 '+(54+p.t*40)+'px system-ui';ctx.textAlign='center';
-    ctx.lineWidth=8;ctx.strokeStyle='#000';ctx.fillStyle='#ffe135';
-    ctx.strokeText(p.txt,p.x,p.y-p.t*80);ctx.fillText(p.txt,p.x,p.y-p.t*80);ctx.restore()}
-  popups=popups.filter(p=>p.t<.7);
+  ctx.save();ctx.translate(shx,shy);
+  updateGloves(dt);
+  drawVideo();drawWarp(dt);drawCheeks();drawGloveShadows();
   ctx.restore();
+  cam.position.x=-shx;cam.position.y=shy;
+  renderer.render(scene,cam);
+  // chữ BỐP! nằm trên cùng
+  uctx.clearRect(0,0,W,H);
+  for(const p of popups){p.t+=dt;const a=1-p.t/.7;if(a<=0)continue;
+    uctx.save();uctx.globalAlpha=a;uctx.font='900 '+(54+p.t*40)+'px system-ui';uctx.textAlign='center';
+    uctx.lineWidth=8;uctx.strokeStyle='#000';uctx.fillStyle='#ffe135';
+    uctx.strokeText(p.txt,p.x,p.y-p.t*80);uctx.fillText(p.txt,p.x,p.y-p.t*80);uctx.restore()}
+  popups=popups.filter(p=>p.t<.7);
   redness=Math.max(0,redness-dt*0.12);
   if(comboT>0){comboT-=dt;if(comboT<=0)combo=0}
   $('combo').textContent=combo>1?`Combo x${combo}`:'';
